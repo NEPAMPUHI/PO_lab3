@@ -56,7 +56,7 @@ public:
 		return id;
 	}
 
-	size_t get_duration() {
+	size_t get_duration() const {
 		return duration_ms;
 	}
 };
@@ -70,7 +70,7 @@ class ThreadSafeQueue {
 	mutable shared_mutex m;
 
 public:
-	inline ThreadSafeQueue() = default;
+	ThreadSafeQueue() = default;
 
 	inline ~ThreadSafeQueue() {
 		clear();
@@ -82,7 +82,7 @@ public:
 		q.emplace(forward<Args>(args)...);
 	}
 
-	inline T pop() {
+	T pop() {
 		unique_lock<shared_mutex> _(m);
 		if (q.empty()) {
 			throw runtime_error("The queue is empty");
@@ -94,17 +94,17 @@ public:
 		}
 	}
 
-	inline bool empty() const {
+	bool empty() const {
 		shared_lock<shared_mutex> _(m);
 		return q.empty();
 	}
 
-	inline int size() const {
+	int size() const {
 		shared_lock<shared_mutex> _(m);
 		return q.size();
 	}
 
-	inline void clear() {
+	void clear() {
 		unique_lock<shared_mutex> _(m);
 		while (!q.empty()) {
 			q.pop();
@@ -132,12 +132,12 @@ class ThreadPoolStatistics : public IThreadPoolEventListener {
 	long long thread_waiting_total_duration_ms = 0;
 	size_t change_queue_size_counter = 0;
 	size_t queue_size_sum = 0;
-	mutex mtx;
+	mutex mtx;//shared_mutex?
 
 public:
 	void on_thread_started(size_t thread_id) override {
 		lock_guard<mutex> _(mtx);
-		thread_last_task_completed_time.emplace(thread_id, steady_clock::now());
+		thread_last_task_completed_time[thread_id] = steady_clock::now();
 	}
 
 	void on_task_added(size_t task_id, size_t current_queue_size) override {
@@ -176,21 +176,25 @@ public:
 	}
 
 	double get_average_queue_size() {
+		lock_guard<mutex> _(mtx);
 		if (change_queue_size_counter == 0) return 0.0;
 		return (double) queue_size_sum / (double) change_queue_size_counter;
 	}
 
 	size_t get_average_task_duration() {
+		lock_guard<mutex> _(mtx);
 		if (total_completed_tasks == 0) return 0;
 		return total_task_duration_ms / total_completed_tasks;
 	}
 
 	size_t get_average_threads_waiting_time() {
+		lock_guard<mutex> _(mtx);
 		if (thread_waiting_count == 0) return 0;
 		return thread_waiting_total_duration_ms / thread_waiting_count;
 	}
 
 	size_t get_average_task_waiting_time() {
+		lock_guard<mutex> _(mtx);
 		if (total_completed_tasks == 0) return 0;
 		return total_task_waiting_ms / total_completed_tasks;
 	}
@@ -203,6 +207,18 @@ public:
 			"\nThe threads' average waiting time: " + to_string(get_average_threads_waiting_time()) + " ms" +
 			"\nAverage queue size: " + to_string(get_average_queue_size()) + "\n";
 		cout << stat;
+	}
+
+	void clear() {
+		lock_guard<mutex> _(mtx);
+		total_completed_tasks = 0;
+		total_created_tasks = 0;
+		total_task_duration_ms = 0;
+		total_task_waiting_ms = 0;
+		thread_waiting_count = 0;
+		thread_waiting_total_duration_ms = 0;
+		change_queue_size_counter = 0;
+		queue_size_sum = 0;
 	}
 };
 
@@ -227,7 +243,6 @@ class ThreadPoolConsoleLogger : public IThreadPoolEventListener {
 
 class ThreadPool {
 	vector<thread> workers;
-	size_t workers_num = 0;
 	ThreadSafeQueue<Task>* queue = nullptr;
 	bool is_initialized = false;
 	atomic<bool> is_paused = false;
@@ -251,8 +266,9 @@ public:
 		}
 		queue = &tasks;
 		workers.resize(thread_num);
-		workers_num = thread_num;
 		is_initialized = true;
+		should_continue = true;
+		is_paused = false;
 	}
 
 	void start() {
@@ -271,13 +287,13 @@ public:
 
 	void resume() {
 		is_paused.store(false);
-		/*for (auto listener : listeners) {
+		for (auto listener : listeners) {
 			for (auto& worker : workers) {
 				thread::id tid = worker.get_id();
 				size_t tid_int = hash<thread::id>{}(tid);
 				listener->on_thread_started(tid_int);
 			}
-		}*/
+		}
 		cond_var.notify_all();
 	}
 
@@ -288,10 +304,10 @@ public:
 			th.join();
 		}
 		is_initialized = false;
+		queue = nullptr;
 	}
 
-	void add_task() {
-		Task task;
+	void add_task(Task&& task) {
 		size_t task_id = task.get_id();
 		queue->emplace(move(task));
 		for (auto listener : listeners) {
@@ -333,19 +349,19 @@ private:
 };
 
 class TaskGenerator {
-	ThreadPool* pool;
-	int timeout_ms;
-	int lifetime_sec;
+	ThreadPool* pool = nullptr;
+	int timeout_ms = 0;
+	int lifetime_sec = 0;
 	int id;
 	static int next_id;
 	thread generator;
-	atomic<bool> should_continue;
-	atomic<bool> is_paused;
+	atomic<bool> should_continue = true;
+	atomic<bool> is_paused = false;
 	mutex mtx;
 	condition_variable cond_var;
 
 public:
-	TaskGenerator() : pool(nullptr), timeout_ms(0), lifetime_sec(-1), id(++next_id), should_continue(true), is_paused(false) {}
+	TaskGenerator() : id(++next_id) {}
 
 	~TaskGenerator() {
 		should_continue.store(false);
@@ -381,17 +397,18 @@ public:
 		cond_var.notify_all();
 	}
 
-	inline void join() {
+	void join() {
 		if (generator.joinable()) {
 			generator.join();
 		}
 	}
 
 private:
-	inline void generate_task() {
+	void generate_task() {
 		string s = "Generator " + to_string(id) + " added task\n";
 		cout << s;
-		pool->add_task();
+		Task task;
+		pool->add_task(move(task));
 	}
 
 	void run() {
@@ -427,6 +444,7 @@ int main() {
 	const int generator_thread_num = 2;
 	const int worker_thread_num = 4;
 	const int lifetime_sec = 20;
+	srand(time(nullptr));
 
 	ThreadSafeQueue<Task> tasks;
 	ThreadPool thread_pool;
@@ -456,6 +474,9 @@ int main() {
 		"Thread pool is paused\n"
 		"********************************************************\n";
 
+	stats.print_stat();
+	stats.clear();
+
 	for (auto& th : generators) {
 		th.start(thread_pool, (rand() % 4 + 1) * 1000, lifetime_sec / 2);
 	}
@@ -467,6 +488,8 @@ int main() {
 	cout << "********************************************************\n"
 		"Thread pool is resumed\n"
 		"********************************************************\n";
+	stats.print_stat();
+	stats.clear();
 	thread_pool.resume();
 
 	for (auto& th : generators) {
@@ -483,6 +506,7 @@ int main() {
 		"********************************************************\n";
 	
 	stats.print_stat();
+	stats.clear();
 
 	cout << "********************************************************\n"
 		"Thread pool is started\n"
